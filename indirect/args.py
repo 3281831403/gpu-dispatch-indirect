@@ -35,6 +35,53 @@ DRAW_SIZE = DRAW_STRUCT.size
 MIN_STRIDE = DRAW_SIZE
 UINT32_MAX = (1 << 32) - 1
 
+_REQUIRED_FIELDS = ("count", "instance", "first", "base_vertex")
+
+
+def _is_int(value) -> bool:
+    """True for real integers; booleans are not valid argument values."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _checked_command(cmd: Mapping[str, int]) -> dict:
+    """Validate one command mapping and return its four uint32 fields."""
+    if not isinstance(cmd, Mapping):
+        raise IndirectError(f"command must be a mapping, got {type(cmd).__name__}")
+    keys = set(cmd)
+    expected = set(_REQUIRED_FIELDS)
+    missing = expected - keys
+    extra = keys - expected
+    if missing:
+        raise IndirectError(f"command is missing fields: {sorted(missing)}")
+    if extra:
+        raise IndirectError(f"command has unexpected fields: {sorted(extra)}")
+    values = {}
+    for field in _REQUIRED_FIELDS:
+        value = cmd[field]
+        if not _is_int(value):
+            raise IndirectError(
+                f"{field} must be an integer, got {value!r}"
+            )
+        if not 0 <= value <= UINT32_MAX:
+            raise IndirectError(
+                f"{field}={value} is outside the uint32 range"
+            )
+        values[field] = value
+    return values
+
+
+def _checked_stride(stride: int) -> int:
+    """Validate a byte stride: an integer >= MIN_STRIDE and a multiple of 4."""
+    if not _is_int(stride):
+        raise IndirectError(f"stride must be an integer, got {stride!r}")
+    if stride < MIN_STRIDE:
+        raise IndirectError(
+            f"stride {stride} is smaller than one command ({MIN_STRIDE} bytes)"
+        )
+    if stride % 4 != 0:
+        raise IndirectError(f"stride {stride} is not a multiple of 4")
+    return stride
+
 
 def pack_draw(cmd: Mapping[str, int]) -> bytes:
     """Pack one indirect-draw command into exactly 20 bytes.
@@ -50,7 +97,14 @@ def pack_draw(cmd: Mapping[str, int]) -> bytes:
     fields, non-integer values, and values outside the uint32 range raise
     ``IndirectError``.
     """
-    raise NotImplementedError
+    values = _checked_command(cmd)
+    return DRAW_STRUCT.pack(
+        values["count"],
+        values["instance"],
+        values["first"],
+        values["base_vertex"],
+        0,
+    )
 
 
 def unpack_draw(data: bytes) -> dict:
@@ -69,7 +123,21 @@ def unpack_draw(data: bytes) -> dict:
     raises ``IndirectError``. The parser never reads into an adjacent command
     in a larger buffer.
     """
-    raise NotImplementedError
+    data = bytes(data)
+    if len(data) != DRAW_SIZE:
+        raise IndirectError(
+            f"packed command must be exactly {DRAW_SIZE} bytes, "
+            f"got {len(data)}"
+        )
+    count, instance, first, base_vertex, reserved = DRAW_STRUCT.unpack(data)
+    if reserved != 0:
+        raise IndirectError("reserved word must be zero")
+    return {
+        "count": count,
+        "instance": instance,
+        "first": first,
+        "base_vertex": base_vertex,
+    }
 
 
 def batch_writes(cmds: Sequence[Mapping[str, int]], stride: int) -> bytes:
@@ -88,7 +156,16 @@ def batch_writes(cmds: Sequence[Mapping[str, int]], stride: int) -> bytes:
     ``IndirectError`` before any output is returned, so a short/overlapping
     stride can never write into the next command's slot.
     """
-    raise NotImplementedError
+    stride = _checked_stride(stride)
+    # Validate every command before building anything: all-or-nothing.
+    packed = [pack_draw(cmd) for cmd in cmds]
+    if not packed:
+        return b""
+    buffer = bytearray(len(packed) * stride)
+    for index, blob in enumerate(packed):
+        start = index * stride
+        buffer[start : start + DRAW_SIZE] = blob
+    return bytes(buffer)
 
 
 def align_stride(size: int, alignment: int) -> int:
@@ -104,7 +181,13 @@ def align_stride(size: int, alignment: int) -> int:
     or not a power of two, raises ``IndirectError`` instead of dividing by
     zero or silently truncating.
     """
-    raise NotImplementedError
+    if not _is_int(size) or size < 0:
+        raise IndirectError(f"size must be a non-negative integer, got {size!r}")
+    if not _is_int(alignment) or alignment <= 0 or (alignment & (alignment - 1)):
+        raise IndirectError(
+            f"alignment must be a positive power of two, got {alignment!r}"
+        )
+    return -(-size // alignment) * alignment
 
 
 def apply_base_offset(
@@ -122,7 +205,29 @@ def apply_base_offset(
     command. This prevents index wrap-around and keeps every draw inside the
     valid argument range.
     """
-    raise NotImplementedError
+    if not _is_int(offset) or offset < 0:
+        raise IndirectError(
+            f"offset must be a non-negative integer, got {offset!r}"
+        )
+    # Validate everything before returning anything: all-or-nothing.
+    values = [_checked_command(cmd) for cmd in cmds]
+    adjusted = []
+    for value in values:
+        first = value["first"] + offset
+        base_vertex = value["base_vertex"] + offset
+        if first > UINT32_MAX or base_vertex > UINT32_MAX:
+            raise IndirectError(
+                "base offset would overflow the uint32 argument range"
+            )
+        adjusted.append(
+            {
+                "count": value["count"],
+                "instance": value["instance"],
+                "first": first,
+                "base_vertex": base_vertex,
+            }
+        )
+    return adjusted
 
 
 def split_by_budget(
@@ -141,7 +246,15 @@ def split_by_budget(
     This is a byte-budget split, not a command-count split: 5 commands with
     ``max_bytes=45`` yield chunk sizes ``[2, 2, 1]`` rather than 5 or 3.
     """
-    raise NotImplementedError
+    if not _is_int(max_bytes) or max_bytes < MIN_STRIDE:
+        raise IndirectError(
+            f"max_bytes must be an integer >= {MIN_STRIDE}, got {max_bytes!r}"
+        )
+    per_chunk = max_bytes // DRAW_SIZE
+    chunks = []
+    for start in range(0, len(cmds), per_chunk):
+        chunks.append(list(cmds[start : start + per_chunk]))
+    return chunks
 
 
 def validate_args(cmds: Sequence[Mapping[str, int]]) -> list[str]:
@@ -159,7 +272,48 @@ def validate_args(cmds: Sequence[Mapping[str, int]]) -> list[str]:
     order; one command may contribute more than one issue. Validation never
     mutates the commands and never raises ``IndirectError`` for bad data.
     """
-    raise NotImplementedError
+    issues = []
+    for index, cmd in enumerate(cmds):
+        if not isinstance(cmd, Mapping):
+            issues.append(f"command {index}: not a mapping")
+            continue
+        for field in _REQUIRED_FIELDS:
+            if field not in cmd:
+                issues.append(f"command {index}: missing field {field!r}")
+        for field in _REQUIRED_FIELDS:
+            if field not in cmd:
+                continue
+            value = cmd[field]
+            if not _is_int(value):
+                issues.append(
+                    f"command {index}: {field} is not an integer: {value!r}"
+                )
+                continue
+            if value < 0:
+                issues.append(
+                    f"command {index}: negative offset {field}={value}"
+                )
+            elif value > UINT32_MAX:
+                issues.append(
+                    f"command {index}: {field}={value} exceeds uint32 range"
+                )
+        count = cmd.get("count")
+        if _is_int(count) and count <= 0:
+            issues.append(
+                f"command {index}: count must be positive, got {count}"
+            )
+        if "stride" in cmd:
+            stride = cmd["stride"]
+            if (
+                not _is_int(stride)
+                or stride < MIN_STRIDE
+                or stride % 4 != 0
+            ):
+                issues.append(
+                    f"command {index}: stride must be an integer >= "
+                    f"{MIN_STRIDE} and a multiple of 4, got {stride!r}"
+                )
+    return issues
 
 
 def dispatch_batch(
@@ -188,4 +342,37 @@ def dispatch_batch(
     between batches. Buffer and command order is preserved on success; empty
     input returns ``{"batches": [], "data": b"", "count": 0, ...}``.
     """
-    raise NotImplementedError
+    if not isinstance(config, Mapping):
+        raise IndirectError("config must be a mapping")
+    for key in ("stride", "max_bytes"):
+        if key not in config:
+            raise IndirectError(f"config is missing {key!r}")
+    stride = _checked_stride(config["stride"])
+    max_bytes = config["max_bytes"]
+    if not _is_int(max_bytes) or max_bytes < MIN_STRIDE:
+        raise IndirectError(
+            f"max_bytes must be an integer >= {MIN_STRIDE}, got {max_bytes!r}"
+        )
+
+    # Validate every buffer before building anything: all-or-nothing, and no
+    # buffer is ever shared between batches.
+    buffers = list(buffers)
+    for buffer in buffers:
+        if isinstance(buffer, (str, bytes)) or not isinstance(buffer, Sequence):
+            raise IndirectError("each buffer must be a sequence of commands")
+        for cmd in buffer:
+            _checked_command(cmd)
+        size = len(buffer) * stride
+        if buffer and size > max_bytes + 1:
+            raise IndirectError(
+                f"buffer of {len(buffer)} commands needs {size} bytes, "
+                f"exceeding the {max_bytes}-byte budget"
+            )
+
+    batches = [batch_writes(buffer, stride) for buffer in buffers]
+    return {
+        "batches": batches,
+        "data": b"".join(batches),
+        "count": sum(len(buffer) for buffer in buffers),
+        "stride": stride,
+    }
